@@ -116,18 +116,15 @@ app.get("/hls/*", async (req, res) => {
   }
 });
 
-// ===== Embedded player page (same-origin) =====
-// افتحها مباشرة أو ضَعها داخل <iframe> في Neocities
-// مثال: https://YOUR-APP.onrender.com/player?src=/hls/live2/playlist.m3u8
 app.get("/player", (req, res) => {
   const q = req.query.src || "/hls/live/playlist.m3u8";
   const host = req.get("host");
   const absSrc = q.startsWith("http") ? q : `https://${host}${q}`;
 
-  // CSP مناسبة لأن الاتصالات ستكون لنفس الأصل
+  // ✅ CSP تسمح بالـinline + worker + blob، وكل الاتصالات self
   res.set("Content-Security-Policy", [
     "default-src 'self'",
-    "script-src 'self' https://cdn.jsdelivr.net",
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
     "worker-src 'self' blob:",
     "connect-src 'self'",
     "media-src 'self' blob: data:",
@@ -183,3 +180,4 @@ app.get("/", (req, res) => {
 // استماع
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`HLS proxy running on :${PORT}`));
+
