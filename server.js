@@ -21,7 +21,7 @@ function addCors(res) {
   });
 }
 
-app.options("*", (req, res) => { addCors(res); res.status(204).end(); });
+app.options("*", (req, res) => { addCors(res); return res.status(204).end(); });
 
 // وسيط لمسارات HLS فقط (أماناً)
 app.get("/hls/*", async (req, res) => {
@@ -93,7 +93,8 @@ app.get("/hls/*", async (req, res) => {
         // نسبي -> مطلق عبر وسيطك
         return `${selfBase}${baseDir}${t}`;
       }).join("\n");
-
+res.set("Content-Disposition", 'inline; filename="playlist.m3u8"');
+res.set("X-Content-Type-Options", "nosniff");
       return res.send(rewritten);
     }
 
@@ -112,3 +113,4 @@ app.get("/", (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`HLS proxy running on :${PORT}`));
+
