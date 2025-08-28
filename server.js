@@ -133,7 +133,7 @@ app.get("/player", (req, res) => {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>HLS-hope</title>
+<title>HLS-player</title>
 <link rel="icon" href="data:,">
 <style>body{margin:0;background:#000;color:#fff;font-family:system-ui}.wrap{padding:16px;max-width:960px;margin:auto}video{width:100%;background:#000;border-radius:8px}</style>
 </head>
@@ -169,5 +169,6 @@ app.get("/", (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`HLS proxy running on :${PORT}`));
+
 
 
