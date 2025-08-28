@@ -1,116 +1,80 @@
 import express from "express";
-import fetch, { Headers } from "node-fetch";
-import https from "https";
+import fetch from "node-fetch";
 
 const app = express();
-
-// أصل HLS (سيرفرك). أبقه https لأنك قلت VLC لا يعمل إلا https:
+const PORT = process.env.PORT || 10000;
 const ORIGIN = process.env.ORIGIN || "https://46.152.153.249";
 
-// وكيل HTTPS يسمح بشهادة غير موثوقة upstream (حل مشكلتك مع الـIP)
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
-
-// CORS headers
+// دالة CORS قوية
 function addCors(res) {
-  res.set({
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-    "Access-Control-Allow-Headers": "Range, Origin, Accept, Content-Type, Referer, User-Agent",
-    "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range, Content-Type",
-    "Timing-Allow-Origin": "*",
-  });
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Range");
 }
 
-app.options("*", (req, res) => { addCors(res); return res.status(204).end(); });
-
-// وسيط لمسارات HLS فقط (أماناً)
-app.get("/hls/*", async (req, res) => {
+// للـ preflight
+app.options("*", (req, res) => {
   addCors(res);
+  return res.status(204).end();
+});
 
-  // عنوان upstream المطلوب (يحافظ على نفس /hls/...):
-  const upstreamUrl = ORIGIN + req.originalUrl; // مثال: https://46.152.153.249/hls/live/playlist.m3u8
-
+// بروكسي للملفات
+app.get("/hls/*", async (req, res) => {
   try {
-    // لا نسمح بالضغط كي نقدر نعيد كتابة m3u8 إذا لزم
-    const reqHeaders = new Headers();
-    if (req.headers["range"]) reqHeaders.set("Range", req.headers["range"]);
-    if (req.headers["user-agent"]) reqHeaders.set("User-Agent", req.headers["user-agent"]);
-    reqHeaders.set("Accept-Encoding", "");
+    const targetUrl = ORIGIN + req.path.replace("/hls", "");
+    console.log("Proxying:", targetUrl);
 
-    const up = await fetch(upstreamUrl, {
-      method: "GET",
-      headers: reqHeaders,
-      agent: httpsAgent, // هنا نتجاوز تحقق الشهادة
-      redirect: "follow",
+    // اجبار User-Agent زي VLC
+    const response = await fetch(targetUrl, {
+      headers: { "User-Agent": "VLC/3.0.18 LibVLC/3.0.18" }
     });
 
-    // حالة بسيطة: إن فشل upstream، أبلغ المستخدم
-    if (!up.ok) {
-      const text = await up.text().catch(() => "");
-      return res.status(up.status).type("text/plain").send(
-        `Upstream returned ${up.status}\nURL: ${upstreamUrl}\n${text}`
-      );
+    if (!response.ok) {
+      return res.status(response.status).send("Upstream error");
     }
 
-    // تحديد النوع
-    const p = req.path.toLowerCase();
-    const isM3U8 = p.endsWith(".m3u8");
-    const isTS   = p.endsWith(".ts") || p.endsWith(".m4s") || p.endsWith(".mp4") || p.endsWith(".aac") || p.endsWith(".m4a") || p.endsWith(".m4v");
+    // معالجة playlist.m3u8
+    if (req.path.endsWith(".m3u8")) {
+      let text = await response.text();
 
-    // كاش مناسب
-    res.set("Cache-Control",
-      isM3U8 ? "public, max-age=3, must-revalidate" :
-      (isTS ? "public, max-age=60, immutable" : "no-store")
-    );
+      // rewrite الروابط الداخلية للـ proxy
+      text = text.replace(/(https?:\/\/[^\/]+)?\/(.*\.m3u8)/g,
+        (_, __, p2) => `${req.protocol}://${req.get("host")}/hls/${p2}`);
 
-    // Content-Type
-    if (isM3U8) res.type("application/vnd.apple.mpegurl; charset=utf-8");
-    else if (p.endsWith(".ts")) res.type("video/mp2t");
-    else if (p.endsWith(".mp4")) res.type("video/mp4");
-    else if (p.endsWith(".aac")) res.type("audio/aac");
+      text = text.replace(/(https?:\/\/[^\/]+)?\/(.*\.(ts|mp4|m4s))/g,
+        (_, __, p2) => `${req.protocol}://${req.get("host")}/hls/${p2}`);
 
-    if (isM3U8) {
-      // إعادة الكتابة:
-      // 1) أي روابط مطلقة نحو الـIP تتحول إلى وسيطك (https://your-app/..)
-      // 2) الروابط النسبية تُحوّل إلى مطلقة عبر وسيطك
-      const text = await up.text();
-
-      const scheme = req.headers["x-forwarded-proto"] || req.protocol || "https";
-      const host = req.headers["x-forwarded-host"] || req.get("host");
-      const selfBase = `${scheme}://${host}`;
-
-      // مسار الدليل الحالي للقائمة
-      const baseDir = req.originalUrl.substring(0, req.originalUrl.lastIndexOf("/") + 1);
-
-      // استبدال مطلق للـIP بالدومين (إن وُجد)
-      let rewritten = text.replaceAll("https://46.152.153.249", selfBase);
-
-      // تحويل الأسطر غير التعليقات (الروابط النسبية) إلى مطلقة عبر الوسيط
-      rewritten = rewritten.split("\n").map(line => {
-        const t = line.trim();
-        if (!t || t.startsWith("#")) return line;
-        if (/^https?:\/\//i.test(t)) return line; // صار مطلقًا بالفعل
-        // نسبي -> مطلق عبر وسيطك
-        return `${selfBase}${baseDir}${t}`;
-      }).join("\n");
-res.set("Content-Disposition", 'inline; filename="playlist.m3u8"');
-res.set("X-Content-Type-Options", "nosniff");
-      return res.send(rewritten);
+      addCors(res);
+      res.type("application/vnd.apple.mpegurl");
+      res.set("Content-Disposition", 'inline; filename="playlist.m3u8"');
+      res.set("X-Content-Type-Options", "nosniff");
+      return res.send(text);
     }
 
-    // لغير m3u8 (القطع)، مرّر الستريم كما هو
-    res.status(up.status);
-    up.body.pipe(res);
-  } catch (e) {
-    res.status(502).type("text/plain").send(`Upstream fetch failed: ${e?.message || e}\nTried: ${upstreamUrl}`);
+    // معالجة ملفات ts/m4s
+    if (req.path.endsWith(".ts") || req.path.endsWith(".m4s")) {
+      addCors(res);
+      res.type("video/mp2t");
+      res.set("X-Content-Type-Options", "nosniff");
+      response.body.pipe(res);
+      return;
+    }
+
+    // أي ملف ثاني
+    addCors(res);
+    res.type(response.headers.get("content-type") || "application/octet-stream");
+    response.body.pipe(res);
+  } catch (err) {
+    console.error("Proxy error:", err);
+    res.status(500).send("Proxy failed");
   }
 });
 
-// صحّة الخدمة
 app.get("/", (req, res) => {
-  res.type("text/plain").send("HLS Proxy is running. Use /hls/... paths.");
+  addCors(res);
+  res.send("HLS Proxy is running. Use /hls/... paths.");
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`HLS proxy running on :${PORT}`));
-
+app.listen(PORT, () => {
+  console.log(`HLS proxy running on :${PORT}`);
+});
