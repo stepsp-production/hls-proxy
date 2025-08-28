@@ -111,7 +111,7 @@ app.get("/hls/*", async (req, res) => {
 });
 
 // صفحة لاعب اختيارية (للاستخدام في iframe إن احتجت)
-app.get("/player", (req, res) => {
+app.get("/hls-hope", (req, res) => {
   const q = req.query.src || "/hls/live/playlist.m3u8";
   const host = req.get("host");
   const absSrc = q.startsWith("http") ? q : `https://${host}${q}`;
@@ -133,7 +133,7 @@ app.get("/player", (req, res) => {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>HLS Player</title>
+<title>HLS-hope</title>
 <link rel="icon" href="data:,">
 <style>body{margin:0;background:#000;color:#fff;font-family:system-ui}.wrap{padding:16px;max-width:960px;margin:auto}video{width:100%;background:#000;border-radius:8px}</style>
 </head>
@@ -169,3 +169,4 @@ app.get("/", (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`HLS proxy running on :${PORT}`));
+
