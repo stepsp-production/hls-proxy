@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // ✳️ عدّل هذا إن كان لديك مصدر آخر
-const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'httpS://46.152.153.249').replace(/\/$/, '');
+const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://46.152.153.249').replace(/\/$/, '');
 
 app.use(cors());
 app.use(compression());
@@ -90,5 +90,6 @@ app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`➡️  Upstream base: ${UPSTREAM_BASE}`);
 });
+
 
 
