@@ -1,95 +1,90 @@
-// server.js
+// hls-proxy server.js
 const express = require('express');
-const cors = require('cors');
+const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
 const compression = require('compression');
 const morgan = require('morgan');
+const cors = require('cors');
 const path = require('path');
 
+// غيّر الأصل من الإعدادات في Render: ORIGIN_BASE=http://46.152.153.249
+const ORIGIN_BASE = process.env.ORIGIN_BASE || 'http://46.152.153.249';
+
 const app = express();
-const PORT = process.env.PORT || 10000;
-
-// ✳️ عدّل هذا إن كان لديك مصدر آخر
-const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://46.152.153.249').replace(/\/$/, '');
-
-app.use(cors());
-app.use(compression());
+app.set('trust proxy', true);
 app.use(morgan('dev'));
-app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
+app.use(compression());
+app.use(cors({
+  origin: true,
+  credentials: false,
+  exposedHeaders: ['Content-Length', 'Content-Range']
+}));
 
-app.get('/', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'player.html'));
+// رأس أمني مع سماح HLS
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  // اسمح للمتصفح بطلب المانيفست والتسيوغ
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  next();
 });
 
-// Preflight
-app.options('/hls/*', (_req, res) => {
-  res.set({
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS',
-    'Access-Control-Allow-Headers': 'Origin, Referer, Range, Accept, Content-Type',
-  });
-  res.sendStatus(204);
-});
-
-// Proxy
-app.use('/hls', async (req, res) => {
-  try {
-    // نستخدم المسار كما هو (مثال: /hls/live2/playlist.m3u8?x=1)
-    const targetUrl = UPSTREAM_BASE + req.originalUrl;
-
-    // رؤوس مناسبة — نلغي Origin/Referer و Accept-Encoding
-    const headers = {
-      'user-agent': req.headers['user-agent'] || 'Mozilla/5.0',
-      'accept': req.headers['accept'] || '*/*',
-    };
-    if (req.headers['range']) headers['range'] = req.headers['range'];
-
-    const upstreamResp = await fetch(targetUrl, { method: req.method, headers });
-
-    if (!upstreamResp.ok) {
-      console.error('Upstream not OK:', upstreamResp.status, targetUrl);
+// وكيل HLS: يمرر كل شيء تحت /hls/* إلى المصدر
+app.use('/hls', createProxyMiddleware({
+  target: ORIGIN_BASE,
+  changeOrigin: true,
+  secure: false,           // لا تتحقق من شهادة TLS (نحن نستعمل HTTP أصلاً)
+  ws: false,
+  followRedirects: true,
+  // نحافظ على رؤوس HLS المهمة
+  onProxyReq: (proxyReq, req) => {
+    proxyReq.setHeader('Connection', 'keep-alive');
+    if (req.headers['range']) proxyReq.setHeader('Range', req.headers['range']);
+    proxyReq.setHeader('Accept', '*/*');
+    proxyReq.setHeader('User-Agent', req.headers['user-agent'] || 'Mozilla/5.0');
+    proxyReq.setHeader('Referer', ORIGIN_BASE + '/');
+    proxyReq.setHeader('Origin', ORIGIN_BASE);
+  },
+  onProxyRes: (proxyRes, req, res) => {
+    // تأكد من Content-Type الصحيح
+    const u = req.url || '';
+    if (u.endsWith('.m3u8')) proxyRes.headers['content-type'] = 'application/vnd.apple.mpegurl';
+    if (u.endsWith('.ts') || u.endsWith('.m4s')) proxyRes.headers['content-type'] = 'video/mp2t';
+    // اسمح بالـ range
+    if (proxyRes.headers['accept-ranges'] !== 'bytes') {
+      proxyRes.headers['accept-ranges'] = 'bytes';
     }
+    // CORS
+    proxyRes.headers['access-control-allow-origin'] = '*';
+  },
+  // رجّع رسالة أوضح بدلاً من 502 صامتة
+  selfHandleResponse: false,
+  proxyTimeout: 25_000,
+  timeout: 25_000,
+}));
 
-    // لو الملف .m3u8 نحاول ضبط Content-Type
-    if (/\.m3u8($|\?)/i.test(req.originalUrl)) {
-      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    }
-
-    res.status(upstreamResp.status);
-    const passHeaders = [
-      'content-length', 'accept-ranges', 'content-range',
-      'cache-control', 'etag', 'last-modified'
-    ];
-    for (const h of passHeaders) {
-      const v = upstreamResp.headers.get(h);
-      if (v) res.setHeader(h, v);
-    }
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    if (!upstreamResp.body) return res.end();
-
-    const reader = upstreamResp.body.getReader();
-    const pump = () => reader.read().then(({ done, value }) => {
-      if (done) return res.end();
-      res.write(value);
-      return pump();
-    });
-    pump().catch(() => res.end());
-
-  } catch (err) {
-    console.error('Proxy error:', err);
-    res.status(502).send('Bad Gateway (proxy failed)');
-  }
+// صفحة اختبار بسيطة: /player?src=/hls/live2/playlist.m3u8
+app.get('/player', (req, res) => {
+  const src = req.query.src || '/hls/live/playlist.m3u8';
+  res.type('html').send(`<!doctype html>
+<meta charset="utf-8">
+<title>HLS Test</title>
+<body style="background:#000;margin:0;display:grid;place-items:center;height:100vh">
+<video id="v" controls playsinline style="width:min(90vw,900px);max-height:90vh;background:#111"></video>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script>
+const v=document.getElementById('v'); const src=${JSON.stringify(src)};
+if (Hls.isSupported()){
+  const h=new Hls(); h.loadSource(src); h.attachMedia(v);
+  h.on(Hls.Events.ERROR,(e,d)=>console.log('HLS error',d));
+}else{ v.src=src; }
+</script>`);
 });
 
-// أي مسار آخر → player.html
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'player.html'));
-});
+// ستاتيك اختياري لو أردت public/
+app.use(express.static(path.join(__dirname, 'public')));
 
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-  console.log(`➡️  Upstream base: ${UPSTREAM_BASE}`);
-});
+// صحّة
+app.get('/healthz', (_, r)=>r.send('ok'));
 
-
-
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log('Proxy on', PORT, '→', ORIGIN_BASE));
