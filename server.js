@@ -1,174 +1,182 @@
 // server.js
+// -------------------------------
+// HLS transparent proxy + playlist rewriter
+// -------------------------------
+
 import express from "express";
-import fetch, { Headers } from "node-fetch";
-import https from "https";
+import fetch from "node-fetch";
+import path from "path";
+
+// غيّر هذا لو اختلف مسار الـ Worker عندك
+const UPSTREAM_BASE = "https://races-player.it-f2c.workers.dev";
 
 const app = express();
-const ORIGIN = process.env.ORIGIN || "https://46.152.153.249";
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
-// CORS
-function addCors(res) {
-  res.set("Access-Control-Allow-Origin", "*");
-  res.set("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Range, Referer, User-Agent");
-  res.set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range, Content-Type");
-  res.set("Timing-Allow-Origin", "*");
+// CORS عام لكل الردود
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Range"
+  );
+  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+
+// أداة مساعدة: يحدّد النوع من الامتداد
+function guessContentType(urlPath) {
+  const ext = path.extname(urlPath).toLowerCase();
+  if (ext === ".m3u8") return "application/vnd.apple.mpegurl";
+  if (ext === ".mpd") return "application/dash+xml";
+  if (ext === ".ts") return "video/mp2t";
+  if (ext === ".m4s") return "video/iso.segment";
+  if (ext === ".mp4") return "video/mp4";
+  if (ext === ".aac") return "audio/aac";
+  return "application/octet-stream";
 }
-app.options("*", (req, res) => { addCors(res); res.status(204).end(); });
 
-// إعادة محاولة خفيفة
-async function fetchWithRetry(url, options={}, retries=1) {
-  let last, res;
-  for (let i=0;i<=retries;i++){
+// يعيد كتابة أسطر الـ m3u8 لتشير إلى هذا السيرفر بدل المصدر الأصلي
+function rewriteM3U8(baseUpstreamUrl, bodyText) {
+  const base = new URL(baseUpstreamUrl);
+  const lines = bodyText.split(/\r?\n/).map((ln) => {
+    // أسطر الميتاداتا تبقى كما هي
+    if (!ln || ln.startsWith("#")) return ln;
+
+    // حوّل المسارات النسبية إلى مطلقة على المصدر، ثم أعد كتابتها للبروكسي
+    // 1) اصنع URL مطلق نحو الـ Upstream
+    let targetAbs;
     try {
-      res = await fetch(url, options);
-      if (res.ok) return res;
-      if (![502,504].includes(res.status)) return res;
-    } catch(e){ last = e; }
-    await new Promise(r => setTimeout(r, 300));
-  }
-  if (res) return res;
-  throw last || new Error("fetch failed");
-}
-
-app.get("/favicon.ico", (req,res)=> res.status(204).end());
-
-app.get("/hls/*", async (req, res) => {
-  addCors(res);
-  const upstreamUrl = ORIGIN + req.originalUrl;
-
-  try {
-    const hdr = new Headers();
-    if (req.headers.range) hdr.set("Range", req.headers.range);
-    hdr.set("User-Agent", req.headers["user-agent"] || "VLC/3.0.18 LibVLC/3.0.18");
-    hdr.set("Accept-Encoding", ""); // لا ضغط كي نعيد الكتابة بسهولة
-    hdr.set("Referer", ORIGIN);
-    hdr.set("Origin", ORIGIN);
-
-    const up = await fetchWithRetry(upstreamUrl, {
-      method: "GET",
-      headers: hdr,
-      agent: httpsAgent,
-      redirect: "follow",
-    }, 1);
-
-    if (!up.ok) {
-      const txt = await up.text().catch(()=> "");
-      res.status(up.status).type("text/plain")
-         .send(`Upstream returned ${up.status}\nURL: ${upstreamUrl}\n${txt}`);
-      return;
+      targetAbs = new URL(ln, base).toString();
+    } catch {
+      return ln; // لو السطر مش URL
     }
 
-    const p = req.path.toLowerCase();
-    const isM3U8 = p.endsWith(".m3u8");
-    const isTS   = p.endsWith(".ts") || p.endsWith(".m4s") || p.endsWith(".mp4") || p.endsWith(".aac") || p.endsWith(".m4a") || p.endsWith(".m4v");
+    // 2) حوّله لمسار على بروكسي Render بنفس الهيكل بعد /hls/
+    // مثال:
+    //   upstream: https://races-player.../hls/live2/segment11902.ts
+    //   proxy  : https://<render>/hls/live2/segment11902.ts
+    const u = new URL(targetAbs);
+    // نبحث عن أول ظهور لمسار /hls/ ونأخذ ما بعده
+    const idx = u.pathname.indexOf("/hls/");
+    if (idx === -1) return ln;
 
-    res.set("Cache-Control",
-      isM3U8 ? "public, max-age=3, must-revalidate"
-             : (isTS ? "public, max-age=60, immutable" : "no-store")
-    );
+    const proxyPath = u.pathname.slice(idx); // يبدأ بـ /hls/...
+    const rebuilt = `${PROXY_ORIGIN}${proxyPath}${u.search || ""}`;
+    return rebuilt;
+  });
 
-    if (isM3U8) {
-      res.type("application/vnd.apple.mpegurl; charset=utf-8");
-      res.set("Content-Disposition", 'inline; filename="playlist.m3u8"');
-      res.set("X-Content-Type-Options", "nosniff");
+  return lines.join("\n");
+}
 
-      const text = await up.text();
-      const scheme = (req.headers["x-forwarded-proto"] || req.protocol || "https");
-      const host   = (req.headers["x-forwarded-host"]  || req.get("host"));
-      const selfBase = `${scheme}://${host}`;
-      const baseDir  = req.originalUrl.substring(0, req.originalUrl.lastIndexOf("/") + 1);
+// نحتاج أصل السيرفر (لإعادة كتابة الـ m3u8). سنولّده ديناميكياً من الطلب.
+function getProxyOrigin(req) {
+  // على Render يكون عندك X-Forwarded-Proto/Host
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  return `${proto}://${host}`;
+}
 
-      let rewritten = text.replaceAll("https://46.152.153.249", selfBase);
-      rewritten = rewritten.split("\n").map(line => {
-        const t = line.trim();
-        if (!t || t.startsWith("#")) return line;
-        if (/^https?:\/\//i.test(t)) return line;
-        return `${selfBase}${baseDir}${t}`;
-      }).join("\n");
+// المسارات الأساسية للبروكسي: أي شيء تحت /hls/* يذهب إلى الـ Upstream بنفس المسار
+app.get("/hls/*", async (req, res) => {
+  try {
+    const upstreamUrl = new URL(req.originalUrl.replace(/^\/+/, "/"), UPSTREAM_BASE).toString();
 
+    // مرّر الـ Range إن وجد (مهم للقطع)
+    const headers = {};
+    if (req.headers.range) headers.Range = req.headers.range;
+
+    const upstreamResp = await fetch(upstreamUrl, { headers });
+
+    // لو 404/502 وغيره، أعده كما هو
+    if (!upstreamResp.ok && upstreamResp.status !== 206) {
+      res.status(upstreamResp.status);
+      upstreamResp.headers.forEach((v, k) => res.setHeader(k, v));
+      // إحفظ CORS
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.send(await upstreamResp.text());
+    }
+
+    const ct = guessContentType(upstreamUrl);
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    // تلميح cache مناسب
+    if (ct.includes("mpegurl") || ct.includes("dash+xml")) {
+      // قوائم: لا نخزن
+      res.setHeader("Cache-Control", "no-store");
+    } else {
+      // القطع: اسمح بتخزين قصير
+      res.setHeader("Cache-Control", "public, max-age=30, immutable");
+    }
+
+    // دعم 206 إن كان الرد جزئي
+    if (upstreamResp.status === 206) {
+      res.status(206);
+      const cr = upstreamResp.headers.get("Content-Range");
+      if (cr) res.setHeader("Content-Range", cr);
+      const len = upstreamResp.headers.get("Content-Length");
+      if (len) res.setHeader("Content-Length", len);
+      res.setHeader("Accept-Ranges", "bytes");
+    }
+
+    // لو m3u8: أعد الكتابة
+    if (ct === "application/vnd.apple.mpegurl") {
+      const text = await upstreamResp.text();
+      // أصل البروكسي الحالي
+      global.PROXY_ORIGIN = getProxyOrigin(req);
+      const rewritten = rewriteM3U8(upstreamUrl, text);
       return res.send(rewritten);
     }
 
-    if (isTS) {
-      if (p.endsWith(".ts"))   res.type("video/mp2t");
-      else if (p.endsWith(".mp4")) res.type("video/mp4");
-      else if (p.endsWith(".aac")) res.type("audio/aac");
-      res.set("X-Content-Type-Options", "nosniff");
-      res.status(up.status);
-      up.body.pipe(res);
-      return;
-    }
-
-    res.type(up.headers.get("content-type") || "application/octet-stream");
-    res.status(up.status);
-    up.body.pipe(res);
-
-  } catch (e) {
-    res.status(502).type("text/plain").send(`Upstream fetch failed: ${e?.message || e}\nTried: ${upstreamUrl}`);
+    // غير ذلك: مرّر الستريم كما هو (مفيد للـ .ts/.m4s)
+    return upstreamResp.body.pipe(res);
+  } catch (err) {
+    console.error("Proxy error:", err);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.status(502).send("Bad Gateway (proxy error)");
   }
 });
 
-// صفحة لاعب اختيارية (للاستخدام في iframe إن احتجت)
+// صفحة لاعب بسيطة اختيارية (لتجربة سريعاً) — افتح /player?src=/hls/live/playlist.m3u8
 app.get("/player", (req, res) => {
-  const q = req.query.src || "/hls/live/playlist.m3u8";
-  const host = req.get("host");
-  const absSrc = q.startsWith("http") ? q : `https://${host}${q}`;
-
-  res.set("Content-Security-Policy", [
-    "default-src 'self'",
-    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
-    "worker-src 'self' blob:",
-    "connect-src 'self'",
-    "media-src 'self' blob: data:",
-    "img-src 'self' data:",
-    "style-src 'self' 'unsafe-inline'",
-    "font-src 'self'",
-    "base-uri 'self'"
-  ].join("; "));
-
-  res.type("html").send(`<!doctype html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>HLS-player</title>
-<link rel="icon" href="data:,">
-<style>body{margin:0;background:#000;color:#fff;font-family:system-ui}.wrap{padding:16px;max-width:960px;margin:auto}video{width:100%;background:#000;border-radius:8px}</style>
-</head>
-<body>
-  <div class="wrap">
-    <h3>قناة اختبار</h3>
-    <video id="v" controls playsinline></video>
-  </div>
-
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script>
-    const SRC = ${JSON.stringify(absSrc)};
-    const v = document.getElementById('v');
-    const hls = (v.canPlayType('application/vnd.apple.mpegurl'))
-      ? null
-      : (window.Hls && Hls.isSupported() ? new Hls({
-          enableWorker:true, lowLatencyMode:true,
-          manifestLoadingMaxRetry:8, manifestLoadingRetryDelay:500, manifestLoadingTimeOut:20000,
-          fragLoadingMaxRetry:6, fragLoadingRetryDelay:400, fragLoadingTimeOut:20000,
-          liveSyncDurationCount:3, liveMaxLatencyDurationCount:10, backBufferLength:30, maxBufferLength:30
-        }) : null);
-    if (hls) { hls.loadSource(SRC); hls.attachMedia(v); }
-    else { v.src = SRC; }
-  </script>
-</body>
-</html>`);
+  const src = req.query.src || "/hls/live/playlist.m3u8";
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HLS Test Player</title>
+<style>body{margin:0;background:#000;display:grid;place-items:center;height:100vh}video{width:90vw;max-width:1100px;height:auto;background:#000}</style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+</head><body>
+<video id="v" controls playsinline muted></video>
+<script>
+const src = ${JSON.stringify(src)};
+const v = document.getElementById('v');
+if (Hls.isSupported()) {
+  const hls = new Hls();
+  hls.loadSource(src);
+  hls.attachMedia(v);
+  hls.on(Hls.Events.MANIFEST_PARSED, ()=> v.play().catch(()=>{}));
+} else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+  v.src = src; v.play().catch(()=>{});
+} else {
+  document.body.innerHTML = '<p style="color:#fff">HLS not supported</p>';
+}
+</script>
+</body></html>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.send(html);
 });
 
+// صحّة الخدمة
 app.get("/", (req, res) => {
-  addCors(res);
-  res.type("text/plain").send("HLS Proxy is running. Use /hls/... or /player?src=/hls/... paths.");
+  res.type("text/plain").send("HLS proxy is running.");
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`HLS proxy running on :${PORT}`));
-
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("Server listening on", PORT);
+});
 
 
