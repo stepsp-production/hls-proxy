@@ -8,24 +8,20 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// عدّل هذا إذا تغيّر الدومين الأصلي
+// ✳️ عدّل هذا إن كان لديك مصدر آخر
 const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://races-player.it-f2c.workers.dev').replace(/\/$/, '');
 
-// Middlewares
 app.use(cors());
 app.use(compression());
 app.use(morgan('dev'));
-
-// Static from public/
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
-// صفحة رئيسية
 app.get('/', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'player.html'));
 });
 
-// التعامل مع Preflight
-app.options('/hls/*', (req, res) => {
+// Preflight
+app.options('/hls/*', (_req, res) => {
   res.set({
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS',
@@ -34,75 +30,58 @@ app.options('/hls/*', (req, res) => {
   res.sendStatus(204);
 });
 
-// بروكسي /hls/*
+// Proxy
 app.use('/hls', async (req, res) => {
   try {
-    // نبقي نفس المسار بالكامل كما طلبه المتصفح
-    // مثال: /hls/live2/playlist.m3u8?x=1
+    // نستخدم المسار كما هو (مثال: /hls/live2/playlist.m3u8?x=1)
     const targetUrl = UPSTREAM_BASE + req.originalUrl;
 
-    // نُحضِّر رؤوس مناسبة
+    // رؤوس مناسبة — نلغي Origin/Referer و Accept-Encoding
     const headers = {
       'user-agent': req.headers['user-agent'] || 'Mozilla/5.0',
       'accept': req.headers['accept'] || '*/*',
-      // لا نرسل accept-encoding حتى لا يعيد المصدر gzip مربك
-      // ولا نرسل host
     };
     if (req.headers['range']) headers['range'] = req.headers['range'];
-    if (req.headers['origin']) headers['origin'] = req.headers['origin'];
-    if (req.headers['referer']) headers['referer'] = req.headers['referer'];
 
-    const upstreamResp = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-    });
+    const upstreamResp = await fetch(targetUrl, { method: req.method, headers });
 
-    // Debug مفيد عند المشاكل
     if (!upstreamResp.ok) {
       console.error('Upstream not OK:', upstreamResp.status, targetUrl);
     }
 
-    res.status(upstreamResp.status);
+    // لو الملف .m3u8 نحاول ضبط Content-Type
+    if (/\.m3u8($|\?)/i.test(req.originalUrl)) {
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    }
 
-    // نمرر الهيدرز المهمة فقط
+    res.status(upstreamResp.status);
     const passHeaders = [
-      'content-type',
-      'content-length',
-      'accept-ranges',
-      'content-range',
-      'cache-control',
-      'etag',
-      'last-modified'
+      'content-length', 'accept-ranges', 'content-range',
+      'cache-control', 'etag', 'last-modified'
     ];
     for (const h of passHeaders) {
       const v = upstreamResp.headers.get(h);
       if (v) res.setHeader(h, v);
     }
-
-    // CORS دائماً
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    if (!upstreamResp.body) {
-      res.end();
-      return;
-    }
+    if (!upstreamResp.body) return res.end();
 
-    // بث جسم الاستجابة كستريم
     const reader = upstreamResp.body.getReader();
-    const pump = () =>
-      reader.read().then(({ done, value }) => {
-        if (done) return res.end();
-        res.write(value);
-        return pump();
-      });
+    const pump = () => reader.read().then(({ done, value }) => {
+      if (done) return res.end();
+      res.write(value);
+      return pump();
+    });
     pump().catch(() => res.end());
+
   } catch (err) {
     console.error('Proxy error:', err);
     res.status(502).send('Bad Gateway (proxy failed)');
   }
 });
 
-// أي مسار آخر يرجع player.html
+// أي مسار آخر → player.html
 app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'player.html'));
 });
