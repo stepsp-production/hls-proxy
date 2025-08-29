@@ -1,123 +1,126 @@
 // server.js
 import express from "express";
-import fetch from "node-fetch";
+import fetch from "node-fetch"; // إذا كنت على Node < 18
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// عدّل هذا لو تغيّر دومين الـ Worker
-const UPSTREAM_BASE = "https://races-player.it-f2c.workers.dev";
-
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// CORS عام
+/** ===== CSP & CORS (للـNeocities والـHLS) ===== */
 app.use((req, res, next) => {
+  // CORS واسع للسماح للتشغيل عبر <video>/MediaSource
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Range"
-  );
   res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
+  res.setHeader("Access-Control-Allow-Headers", "Range, Origin, X-Requested-With, Content-Type, Accept");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+
+  // تمنع بعض مشاكل التحميل في المتصفحات
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+
+  // CSP مع السماح بالـblob: للميديا والاتصال
+  res.setHeader(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.dashjs.org https://www.youtube.com https://player.vimeo.com",
+      "script-src-elem 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.dashjs.org https://www.youtube.com https://player.vimeo.com",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data:",
+      "font-src 'self'",
+      "media-src 'self' blob: data:",
+      "connect-src 'self' blob: data:",
+      "frame-src 'self' https://www.youtube.com https://player.vimeo.com",
+      "worker-src 'self' blob:"
+    ].join("; ")
+  );
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// تقديم ملفات public/ كستاتيك (player.html + app.js)
-app.use(express.static(path.join(__dirname, "public"), {
-  // منع أي تعديلات على الهدرز هنا
-}));
+/** ===== ملفات ثابتة من public/ ===== */
+app.use(express.static(path.join(__dirname, "public")));
 
-function guessContentType(p) {
-  const ext = path.extname(p).toLowerCase();
-  if (ext === ".m3u8") return "application/vnd.apple.mpegurl";
-  if (ext === ".mpd")  return "application/dash+xml";
-  if (ext === ".ts")   return "video/mp2t";
-  if (ext === ".m4s")  return "video/iso.segment";
-  if (ext === ".mp4")  return "video/mp4";
-  if (ext === ".aac")  return "audio/aac";
-  return "application/octet-stream";
-}
+/** صفحة المشغّل: GET /player */
+app.get("/player", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "player.html"));
+});
 
-function rewriteM3U8(baseUpstreamUrl, bodyText, proxyOrigin) {
-  const base = new URL(baseUpstreamUrl);
-  const lines = bodyText.split(/\r?\n/).map((ln) => {
-    if (!ln || ln.startsWith("#")) return ln;
-    let abs;
-    try { abs = new URL(ln, base).toString(); } catch { return ln; }
-    const u = new URL(abs);
-    const idx = u.pathname.indexOf("/hls/");
-    if (idx === -1) return ln;
-    const proxyPath = u.pathname.slice(idx);
-    return `${proxyOrigin}${proxyPath}${u.search || ""}`;
+/** ====== بروكسي بسيط للـHLS (m3u8 + ts/m4s) ======
+ * الفكرة: أنت تدخل /hls/... من الخارج، ونحن نعيد توجيهها إلى المصدر الحقيقي.
+ * عدّل BASE_ORIGIN إلى مصدر القنوات الحقيقي عندك.
+ */
+const BASE_ORIGIN = process.env.HLS_BASE || "https://races-player.it-f2c.workers.dev";
+
+// يعيد كتابة مسارات الـm3u8 لتشير إلى نفس السيرفر (على Render)
+function rewriteManifest(content, reqBasePath) {
+  const lines = content.split("\n").map((ln) => {
+    // سطر قطعة/قائمة فرعية
+    if (ln && !ln.startsWith("#")) {
+      try {
+        const u = new URL(ln, BASE_ORIGIN); // مسار مطلق للمصدر
+        // نعيد كتابته ليمر عبر سيرفرنا: /hls/<…>
+        const pathname = u.pathname.startsWith("/") ? u.pathname : `/${u.pathname}`;
+        return reqBasePath + pathname; // مثال: /hls + /live2/segment123.ts
+      } catch {
+        // لو كان سطر نسبي غريب، نخليه كما هو
+        return ln;
+      }
+    }
+    return ln;
   });
   return lines.join("\n");
 }
 
-function getProxyOrigin(req) {
-  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
-  const host  = req.headers["x-forwarded-host"]  || req.headers.host;
-  return `${proto}://${host}`;
-}
-
+// كل شيء تحت /hls/* نعيد توجيهه للمصدر الحقيقي
 app.get("/hls/*", async (req, res) => {
   try {
-    const upstreamUrl = new URL(req.originalUrl.replace(/^\/+/, "/"), UPSTREAM_BASE).toString();
-    const headers = {};
-    if (req.headers.range) headers.Range = req.headers.range;
+    // المسار بعد /hls
+    const upstreamPath = req.path.replace(/^\/hls/, "");
+    const upstreamURL = BASE_ORIGIN + upstreamPath + (req.url.includes("?") ? "?" + req.url.split("?")[1] : "");
 
-    const upstream = await fetch(upstreamUrl, { headers });
+    const r = await fetch(upstreamURL, {
+      headers: {
+        // دعم Range لملفات .ts
+        Range: req.headers.range || "",
+        "User-Agent": req.headers["user-agent"] || "Mozilla/5.0",
+        Accept: "*/*",
+      },
+    });
 
-    if (!upstream.ok && upstream.status !== 206) {
-      res.status(upstream.status);
-      upstream.headers.forEach((v, k) => res.setHeader(k, v));
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.send(await upstream.text());
-    }
+    // مرِّر كود الحالة كما هو
+    res.status(r.status);
 
-    const ct = guessContentType(upstreamUrl);
-    res.setHeader("Content-Type", ct);
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    // مرِّر بعض الترويسات المهمّة
+    const contentType = r.headers.get("content-type") || "";
+    if (contentType) res.setHeader("Content-Type", contentType);
+    const acceptRanges = r.headers.get("accept-ranges");
+    if (acceptRanges) res.setHeader("Accept-Ranges", acceptRanges);
+    const contentRange = r.headers.get("content-range");
+    if (contentRange) res.setHeader("Content-Range", contentRange);
+    const contentLength = r.headers.get("content-length");
+    if (contentLength) res.setHeader("Content-Length", contentLength);
 
-    if (ct.includes("mpegurl") || ct.includes("dash+xml")) {
-      res.setHeader("Cache-Control", "no-store");
-    } else {
-      res.setHeader("Cache-Control", "public, max-age=30, immutable");
-    }
-
-    if (upstream.status === 206) {
-      res.status(206);
-      const cr = upstream.headers.get("Content-Range");
-      if (cr) res.setHeader("Content-Range", cr);
-      const len = upstream.headers.get("Content-Length");
-      if (len) res.setHeader("Content-Length", len);
-      res.setHeader("Accept-Ranges", "bytes");
-    }
-
-    if (ct === "application/vnd.apple.mpegurl") {
-      const text = await upstream.text();
-      const origin = getProxyOrigin(req);
-      const rewritten = rewriteM3U8(upstreamUrl, text, origin);
+    // m3u8: نعيد كتابة الروابط لتعود عبر /hls/ على نفس السيرفر
+    if (contentType.includes("application/vnd.apple.mpegurl") || upstreamURL.endsWith(".m3u8")) {
+      const text = await r.text();
+      const rewritten = rewriteManifest(text, "/hls");
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8");
       return res.send(rewritten);
     }
 
-    return upstream.body.pipe(res);
-  } catch (e) {
-    console.error("Proxy error:", e);
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    // أي شيء آخر (ts/m4s/…): نعمل stream
+    r.body.pipe(res);
+  } catch (err) {
+    console.error(err);
     res.status(502).send("Bad Gateway (proxy error)");
   }
 });
 
-// صفحة اختبار بدون inline scripts
-app.get("/player", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "player.html"));
-});
+app.get("/", (_req, res) => res.send("HLS proxy is up. Try /player"));
 
-app.get("/", (req, res) => {
-  res.type("text/plain").send("HLS proxy is running.");
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Listening on", PORT));
+app.listen(PORT, () => console.log(`Server on http://localhost:${PORT}`));
