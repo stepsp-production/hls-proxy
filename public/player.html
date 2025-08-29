@@ -1,29 +1,70 @@
 <!doctype html>
 <html lang="ar" dir="rtl">
 <head>
-  <meta charset="utf-8" />
-  <title>HLS Player (Render)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- نحمّل hls.js من jsdelivr -->
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HLS Proxy Player</title>
   <style>
-    html,body{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui}
-    .wrap{display:grid;place-items:center;height:100%}
-    video{width:90vw;max-width:1080px;height:auto;background:#000;outline:none}
-    .bar{position:fixed;inset:auto 0 0 0;padding:8px 12px;background:#0009;backdrop-filter:blur(6px)}
-    input{width:70%;max-width:760px}
+    html,body{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui,Segoe UI,Arial}
+    .wrap{display:flex;flex-direction:column;align-items:center;gap:12px;height:100%;padding:16px}
+    video{max-width:100%;width:100%;height:auto;background:#000;outline:none}
+    .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    input[type="text"]{width:min(820px,90vw);padding:8px;border-radius:8px;border:1px solid #444;background:#111;color:#fff}
+    button{padding:10px 14px;border:0;border-radius:10px;background:#ec407a;color:#fff;font-weight:700;cursor:pointer}
+    button:active{transform:translateY(1px)}
+    .note{opacity:.8;font-size:12px}
+    a{color:#40c4ff}
   </style>
 </head>
 <body>
   <div class="wrap">
+    <div class="bar">
+      <input id="src" type="text" placeholder="/hls/live2/playlist.m3u8">
+      <button id="play">تشغيل</button>
+    </div>
+    <div class="note">مثال سريع: /hls/live2/playlist.m3u8 — تأكد أن هذا المسار يعمل عبر هذا الدومين.</div>
     <video id="v" controls playsinline muted></video>
   </div>
-  <div class="bar">
-    <strong>src:</strong>
-    <input id="src" placeholder="/hls/live2/playlist.m3u8" />
-    <button id="loadBtn">Load</button>
-  </div>
 
-  <script src="/app.js"></script>
+  <!-- hls.js من jsDelivr -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script>
+    const $ = s => document.querySelector(s);
+    const v = $('#v');
+    const inp = $('#src');
+    const btn = $('#play');
+
+    // لو أتيت بـ ?src=...
+    const urlParams = new URLSearchParams(location.search);
+    const initial = urlParams.get('src') || '/hls/live2/playlist.m3u8';
+    inp.value = initial;
+
+    function play(src) {
+      // إذا المتصفح يدعم HLS natively (Safari مثلاً)
+      if (v.canPlayType('application/vnd.apple.mpegurl')) {
+        v.src = src;
+        v.play().catch(()=>{});
+        return;
+      }
+      // hls.js
+      if (window.Hls && Hls.isSupported()) {
+        if (v.hls) { v.hls.destroy(); }
+        const hls = new Hls({ maxLiveSyncPlaybackRate: 1.0 });
+        v.hls = hls;
+        hls.loadSource(src);
+        hls.attachMedia(v);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(()=>{}));
+        hls.on(Hls.Events.ERROR, (e, data) => {
+          console.warn('HLS error', data);
+        });
+      } else {
+        alert('متصفحك لا يدعم HLS.js');
+      }
+    }
+
+    btn.addEventListener('click', () => play(inp.value.trim()));
+    // تشغيل أولي
+    play(initial);
+  </script>
 </body>
 </html>
