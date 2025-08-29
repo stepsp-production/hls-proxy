@@ -1,87 +1,101 @@
 // server.js
+// Node >=18 (يوجد fetch مدمج)
 const express = require('express');
-const morgan  = require('morgan');
-const cors    = require('cors');
-const path    = require('path');
-const { createProxyMiddleware } = require('http-proxy-middleware');
+const cors = require('cors');
+const compression = require('compression');
+const morgan = require('morgan');
+const path = require('path');
 
-const app  = express();
+const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ===== إعداد المصدر (UPSTREAM) =====
-// غيّره من لوحة Render -> Environment إلى عنوان الأساس الصحيح (بدون مسار)
-const UPSTREAM = process.env.UPSTREAM || 'https://races-player.it-f2c.workers.dev';
-// إذا كان المصدر لا يملك بادئة /hls على المسارات، عيّن STRIP_HLS=1 من بيئة Render
-const STRIP_HLS = process.env.STRIP_HLS === '1';
+// ✨ عدّل هذا إن احتجت: هذا هو الأصل الذي سنوجّه له /hls/*
+const UPSTREAM_BASE = process.env.UPSTREAM_BASE || 'https://races-player.it-f2c.workers.dev';
 
+// middlewares
+app.use(cors());
+app.use(compression());
 app.use(morgan('dev'));
-app.use(cors({ origin: '*', credentials: false }));
 
-// ترويسات CORS ولا كاش
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin',  '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  next();
+// ملفات static من public/ (مثلاً /player.html و /app.js …)
+app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
+
+// صفحة مساعدة: /  → تفتح public/player.html
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'player.html'));
 });
 
-// ملفات ثابتة (المشغّل)
-app.use(express.static('public'));
+/**
+ * بروكسي بسيط لمسار /hls/*  → يوجه لنفس المسار على الـ UPSTREAM_BASE
+ * مثال: GET /hls/live2/playlist.m3u8
+ * سيذهب إلى: https://races-player.it-f2c.workers.dev/hls/live2/playlist.m3u8
+ */
+app.use('/hls', async (req, res) => {
+  try {
+    // نبني عنوان الهدف بالحرف: نفس الـ path والـ query
+    const targetUrl = new URL(req.originalUrl, UPSTREAM_BASE).toString();
 
-app.get('/', (req, res) => {
-  res.redirect('/player?src=/hls/live2/playlist.m3u8');
-});
+    // نمرّر الـ headers المهمة (خصوصاً Range)
+    const headers = {
+      'user-agent': req.headers['user-agent'] || 'Mozilla/5.0',
+      'accept': req.headers['accept'] || '*/*',
+      'origin': req.headers['origin'] || undefined,
+      'referer': req.headers['referer'] || undefined,
+    };
+    if (req.headers['range']) headers['range'] = req.headers['range'];
 
-// ========== بروكسي HLS ==========
-app.use('/hls', createProxyMiddleware({
-  target: UPSTREAM,
-  changeOrigin: true,
-  secure: true,
-  ws: false,
-  followRedirects: true,
-  // تعديل المسار حسب الحاجة
-  pathRewrite: (pathReq) => {
-    // مثال: /hls/live2/playlist.m3u8
-    if (STRIP_HLS) {
-      // يصبح /live2/playlist.m3u8
-      return pathReq.replace(/^\/hls(\/|$)/, '/');
+    const upstreamResp = await fetch(targetUrl, {
+      method: req.method,
+      headers,
+      // لا نرسل body في GET/HEAD
+    });
+
+    // نعيد نفس كود الحالة
+    res.status(upstreamResp.status);
+
+    // ننقل عدداً من الهيدرز المهمة فقط (حتى لا نرسل ما يربك المتصفح)
+    const passThroughHeaders = [
+      'content-type',
+      'content-length',
+      'accept-ranges',
+      'content-range',
+      'cache-control',
+      'last-modified',
+      'etag',
+      'access-control-allow-origin'
+    ];
+    passThroughHeaders.forEach(h => {
+      const v = upstreamResp.headers.get(h);
+      if (v) res.setHeader(h, v);
+    });
+
+    // HLS يحتاج CORS واضح دائماً
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (upstreamResp.body) {
+      // نبثّ البودي كستريم (مهم للـ .ts)
+      upstreamResp.body.pipeTo(
+        new WritableStream({
+          write(chunk) { res.write(chunk); },
+          close() { res.end(); },
+          abort() { res.end(); }
+        })
+      ).catch(() => res.end());
+    } else {
+      res.end();
     }
-    // بدون تعديل
-    return pathReq;
-  },
-  onProxyReq(proxyReq, req, res) {
-    // أضف ترويسات قد يطلبها المصدر
-    const origin = new URL(UPSTREAM).origin;
-    proxyReq.setHeader('Origin', origin);
-    proxyReq.setHeader('Referer', origin + '/');
-    proxyReq.setHeader(
-      'User-Agent',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'
-    );
-    proxyReq.setHeader('Cache-Control', 'no-store');
-  },
-  onProxyRes(proxyRes) {
-    // فرض CORS وعدم التخزين
-    proxyRes.headers['access-control-allow-origin']  = '*';
-    proxyRes.headers['access-control-allow-headers'] = 'Origin, X-Requested-With, Content-Type, Accept, Range';
-    proxyRes.headers['access-control-allow-methods'] = 'GET,HEAD,OPTIONS';
-    proxyRes.headers['cache-control'] = 'no-store, no-cache, must-revalidate, proxy-revalidate';
-    delete proxyRes.headers['content-security-policy'];
-    delete proxyRes.headers['x-frame-options'];
-  },
-  onError(err, req, res) {
-    res.writeHead(502, { 'Content-Type': 'text/plain' });
-    res.end('Bad gateway from proxy: ' + (err && err.message ? err.message : String(err)));
-  },
-  // مهلة مريحة للبث
-  proxyTimeout: 25_000,
-  timeout: 25_000,
-}));
+  } catch (err) {
+    console.error('Proxy error:', err);
+    res.status(502).send('Bad Gateway (proxy failed)');
+  }
+});
+
+// أي مسار غير معروف → player.html (حتى يعمل رابط /player?src=...)
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'player.html'));
+});
 
 app.listen(PORT, () => {
-  console.log('Server running on', PORT);
-  console.log('UPSTREAM =', UPSTREAM, ' | STRIP_HLS =', STRIP_HLS);
+  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`➡️  Upstream base: ${UPSTREAM_BASE}`);
 });
