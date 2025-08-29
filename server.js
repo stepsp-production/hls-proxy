@@ -1,40 +1,76 @@
+// server.js
 const express = require('express');
-const morgan = require('morgan');
-const cors = require('cors');
-const compression = require('compression');
-const path = require('path');
+const morgan  = require('morgan');
+const cors    = require('cors');
+const path    = require('path');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 10000;
 
-// لوجينغ وضغط وكورز
+// ===== 1) لوج + CORS عام =====
 app.use(morgan('dev'));
-app.use(compression());
-app.use(cors());
+app.use(cors({ origin: '*', credentials: false }));
 
-// خدمة الملفات الثابتة من مجلد public/
-app.use(express.static(path.join(__dirname, 'public'), {
-  fallthrough: true,
-  maxAge: '1h',
+// ترويسات CORS إضافية لأي رد (احتياطي)
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin',  '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
+  // لا تخزّن لكي لا يعلق المانيفست
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
+
+// ===== 2) ملفات ثابتة من /public =====
+app.use(express.static('public'));
+
+// ===== 3) صفحة افتراضية بسيطة =====
+app.get('/', (req, res) => {
+  // حوّل مباشرة للـ player مع قناة افتراضية (live2) — عدّل إن شئت
+  res.redirect('/player?src=/hls/live2/playlist.m3u8');
+});
+
+// ===== 4) بروكسي HLS =====
+// غيّر هذا حسب مصدر HLS الأصلي لديك
+const UPSTREAM = 'https://races-player.it-f2c.workers.dev';
+
+// أي شيء تحت /hls/* يُرسل للمصدر
+app.use('/hls', createProxyMiddleware({
+  target: UPSTREAM,
+  changeOrigin: true,
+  secure: true,
+  // لا تضغط (HLS أفضل بلا ضغط)
+  selfHandleResponse: false,
+  // إعادة كتابة المسار كما هو (هنا لا نبدّل شيئًا)
+  pathRewrite: (pathReq, req) => {
+    // مثال: /hls/live2/playlist.m3u8  =>  /hls/live2/playlist.m3u8 عند الـ UPSTREAM
+    return pathReq;
+  },
+  onProxyReq(proxyReq, req, res) {
+    // تأكد أن المانيفست/الشرائح تُخدّم فورًا
+    proxyReq.setHeader('Cache-Control', 'no-store');
+  },
+  onProxyRes(proxyRes, req, res) {
+    // فرض CORS للخارج
+    proxyRes.headers['access-control-allow-origin']  = '*';
+    proxyRes.headers['access-control-allow-headers'] = 'Origin, X-Requested-With, Content-Type, Accept, Range';
+    proxyRes.headers['access-control-allow-methods'] = 'GET,HEAD,OPTIONS';
+    // لا كاش
+    proxyRes.headers['cache-control'] = 'no-store, no-cache, must-revalidate, proxy-revalidate';
+    delete proxyRes.headers['content-security-policy'];
+    delete proxyRes.headers['x-frame-options'];
+  },
+  // أخطاء واضحة
+  onError(err, req, res) {
+    res.status(502).end('Bad gateway from proxy: ' + (err?.message || err));
+  }
 }));
 
-// صفحة player.html في public/
-app.get('/player', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'player.html'));
-});
-
-// بروكسي بسيط لـ HLS (تمرير المصدر src كما هو إلى nginx/render upstream إذا كان مفعّل)
-app.get('/hls/*', async (req, res) => {
-  // إن كنت لا تستخدم upstream داخلي، اترك هذا المسار ليعيد 404 أو أعد التوجيه
-  res.status(502).send('Upstream for HLS is not configured on this server.');
-});
-
-// صحّة
-app.get('/health', (_req, res) => res.json({ ok: true }));
-
-// 404 افتراضي
-app.use((_req, res) => res.status(404).send('Not found'));
-
+// ===== 5) تشغيل =====
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log('Server running on port', PORT);
+  console.log('👉 Available at your primary URL');
 });
